@@ -1,0 +1,5 @@
+lxml>=4.9
+dbf>=0.99
+requests>=2.31
+keyring>=24  # Windows Credential Manager for Twilio creds
+openpyxl>=3.1  # optional: only used for checking output

@@ -1,0 +1,62 @@
+; Day Report settings. Copy this file to dayreport.ini (same folder as dayreport.py) and edit.
+; No passwords here: the POS login is stored once with "cmdkey" (see README).
+[dayreport]
+; Passport POS outbox, reached over the dedicated network card (UNC path, no drive letter)
+source_outbox = \\192.168.87.11\XMLGateway\booutbox
+; Local staging folder and archive (same places the old batch file used)
+local_inbox   = C:\shell save\passport\booutbox
+archive_dir   = C:\shell save\passport\booutbox\archive
+; Where the monthly workbooks live
+day_report_dir = C:\Users\Mark\Documents\AEI Data\day_reports
+template       = C:\Users\Mark\Documents\AEI Data\day_reports\day report template.xlsm
+; Item-level history (ISM). Leave empty to skip.
+dailysales_dbf =
+; Log file - read this if something looks wrong
+log_file       = C:\Users\Mark\Documents\AEI Data\day_reports\logs\dayreport.log
+; yes = delete files from the POS outbox after copying (what the old batch file did)
+remove_from_source = yes
+; Print staff PDF reports found in source_outbox (any *.pdf) to this Windows printer, then delete them.
+; A copy of each is kept in archive_dir\printed\YYYY-MM-DD\. Needs SumatraPDF.exe next to dayreport.py.
+print_pdfs  = yes
+pdf_printer = Lexmark in store
+; Seconds to wait for each PDF to print
+pdf_print_timeout = 120
+; Optional: full path to SumatraPDF if it is not next to dayreport.py
+; sumatra_exe = C:\DayReport\SumatraPDF.exe
+
+; Fill tank stick inches (column D) from Tank Watcher readings.
+; The "Day Report Tanks" task (11:55 PM) runs  run_dayreport.bat --grab-tanks , which saves
+; https://gastanks.watch/home into tank-snapshot-YYYY-MM-DD.csv files in tank_csv_dir.
+; The 5:30 AM run fills blank column-D cells from them. No Gmail or Google Drive needed.
+tank_fill    = yes
+; Leave tank_csv_dir out to use <day_report_dir>\tank_snapshots
+tank_csv_dir = C:\AEI Data\day_reports\tank_snapshots
+; Optional grab settings (defaults shown)
+; tank_grab_attempts      = 5
+; tank_grab_retry_seconds = 60
+; Fail (exit code 6) if the site's newest reading is older than this many minutes (0 = off)
+; tank_max_age_minutes    = 180
+
+; Optional: where run status + SMS de-dup memory is kept (default: next to the log file)
+; state_file = C:\Users\Mark\Documents\AEI Data\day_reports\logs\dayreport_state.json
+
+[alerts]
+; SMS alerts through Twilio. Credentials are NOT here: run  python dayreport.py --setup-twilio
+enabled = yes
+site_name = SDS Office PC
+; Don't re-send the same alert within this many hours
+dedup_hours = 12
+; Hold these alert types during quiet hours; they go out after quiet hours end
+; (next run or the watchdog). Empty quiet_hours = never quiet.
+quiet_hours = 22:00-07:00
+quiet_hours_apply_to = success, missing_day
+; Alert types: error, pos_unreachable, collision, missing_day, already_running, success, missed_run
+;   missed_run = sent by the separate watchdog task when today's run did not finish OK.
+
+; ---- Recipients: NONE yet (decided after the stakeholder questionnaire) -> no texts are sent.
+; Add one section per person, e.g.:
+; [recipient.mark]
+; name    = Mark
+; number  = +17575550100
+; alerts  = error, pos_unreachable, collision, missing_day, already_running, missed_run
+; enabled = yes

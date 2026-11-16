@@ -1,0 +1,6 @@
+dayreport.ini
+venv/
+__pycache__/
+*.log
+last_error.txt
+test_output/
