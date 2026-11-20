@@ -907,13 +907,21 @@ def fill_tank_sticks(cfg, dates=None, dry_run=False, today=None):
 # --------------------------------------------------------------------------- Tank Watcher web grab
 # Replaces the Gmail -> Apps Script -> Drive route. A separate nightly task
 # (DayReport_tanks_task.xml, 11:55 PM) runs  run_dayreport.bat --grab-tanks,
-# which reads the public page https://gastanks.watch/home and writes one
-# tank-snapshot-YYYY-MM-DD.csv into tank_csv_dir. The 5:30 AM run then fills
-# column D from it with fill_tank_sticks() above. The grab never touches a
-# workbook or the POS outbox.
+# which first reads the store Pi's local two-decimal CSV
+# (http://192.168.0.28:8088/tanks-YYYY-MM-DD.csv) and falls back to the public
+# page https://gastanks.watch/home if the Pi is unreachable, incomplete, or
+# stale. It writes one tank-snapshot-YYYY-MM-DD.csv into tank_csv_dir. The
+# 5:30 AM run then fills column D from it with fill_tank_sticks() above
+# (heights rounded to 2 decimals). The grab never touches a workbook or the
+# POS outbox.
 TANK_URL = "https://gastanks.watch/home"
+TANK_PI_URL = "http://192.168.0.28:8088"
+TANK_PI_TIMEOUT = 10
+TANK_PI_MAX_AGE_MINUTES = 60
 TANK_CSV_COLUMNS = ["tank_number", "product", "volume", "tc_volume", "ullage", "height",
                     "water", "temperature", "water_volume", "reading_at"]
+# Product names are not in the Pi CSV; these match gastanks.watch / the TLS-350.
+TANK_PRODUCTS = {"01": "Regular", "02": "Diesel", "03": "Premium", "04": "Premium"}
 EXIT_TANK_GRAB = 6
 
 
@@ -1116,8 +1124,151 @@ def write_tank_snapshot(csv_dir, rows, reading_at):
     return path, True
 
 
-def grab_tanks(cfg, fetcher=None, sleep=None, now=None):
-    """--grab-tanks: fetch the page, write the day's snapshot CSV. Returns an exit code."""
+def tank_pi_base_url(cfg):
+    """Pi HTTP base, no trailing slash. Empty tank_pi_url in the ini disables the Pi."""
+    if cfg is not None and "tank_pi_url" in cfg:
+        return (cfg.get("tank_pi_url") or "").strip().rstrip("/")
+    return TANK_PI_URL
+
+
+def fetch_text(url, timeout=TANK_PI_TIMEOUT):
+    """GET url and return decoded text. Used for the Pi CSV (short timeout)."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "DayReport/1.0 (SDS Office PC tank snapshot)",
+        "Accept": "text/csv,text/plain,*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        if getattr(r, "status", 200) != 200:
+            raise TankPageError("HTTP %s from %s" % (r.status, url))
+        raw = r.read()
+        cs = r.headers.get_content_charset() or "utf-8"
+    return raw.decode(cs, errors="replace")
+
+
+def parse_tank_pi_csv(text):
+    """Parse a Pi tanks-YYYY-MM-DD.csv into row dicts (same keys as parse_tank_page).
+
+    Every data row is returned; call latest_rows_per_tank() to keep the newest
+    reading of each tank. Product comes from the file if present, else TANK_PRODUCTS.
+    """
+    import csv, io
+    rows = []
+    reader = csv.DictReader(io.StringIO(text or ""))
+    if not reader.fieldnames:
+        return rows
+    for raw in reader:
+        tank = (raw.get("tank") or raw.get("tank_number") or "").strip()
+        if not tank:
+            continue
+        tnum = tank.zfill(2)
+        ts = (raw.get("timestamp") or raw.get("reading_at") or "").strip().strip('"')
+        try:
+            when = dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        height = _tank_float(raw.get("height"))
+        if height is None:
+            continue
+        rows.append({
+            "tank_number": tnum,
+            "product": (raw.get("product") or "").strip() or TANK_PRODUCTS.get(tnum, ""),
+            "volume": _tank_float(raw.get("volume")),
+            "tc_volume": _tank_float(raw.get("tc_volume")),
+            "ullage": _tank_float(raw.get("ullage")),
+            "height": height,
+            "water": _tank_float(raw.get("water")),
+            "temperature": _tank_float(raw.get("temp") or raw.get("temperature")),
+            "water_volume": _tank_float(raw.get("water_volume")),
+            "reading_at": when,
+        })
+    return rows
+
+
+def latest_rows_per_tank(rows):
+    """Keep the latest reading_at row for each tank_number, sorted by tank."""
+    best = {}
+    for r in rows:
+        t = r["tank_number"]
+        prev = best.get(t)
+        if prev is None or (r.get("reading_at") or dt.datetime.min) >= (prev.get("reading_at") or dt.datetime.min):
+            best[t] = r
+    return [best[k] for k in sorted(best)]
+
+
+def _fetch_one_pi_csv(get, url, errors):
+    try:
+        text = get(url)
+    except Exception as e:
+        errors.append("%s (%s: %s)" % (url, type(e).__name__, e))
+        return []
+    rows = parse_tank_pi_csv(text)
+    if not rows:
+        errors.append("%s (empty or unreadable)" % url)
+    return rows
+
+
+def fetch_pi_tank_rows(cfg, fetched, fetcher=None):
+    """Latest-per-tank rows from the Pi, or None if they should not be used.
+
+    Today's tanks-YYYY-MM-DD.csv is fetched first. Yesterday's file is also
+    considered when the run is before 06:00 or today's file is missing/empty.
+    Rows are used only when every tank in TANK_CSV_MAP is present and the
+    newest reading is within tank_pi_max_age_minutes (default 60).
+    """
+    base = tank_pi_base_url(cfg)
+    if not base:
+        log.info("tank grab: Pi URL is empty - skipping Pi, using gastanks.watch")
+        return None
+    try:
+        max_age = cfg.getint("tank_pi_max_age_minutes", TANK_PI_MAX_AGE_MINUTES)
+    except (TypeError, ValueError):
+        max_age = TANK_PI_MAX_AGE_MINUTES
+    get = fetcher or (lambda url: fetch_text(url, timeout=TANK_PI_TIMEOUT))
+    today = fetched.date()
+    yesterday = today - dt.timedelta(days=1)
+    errors = []
+    today_url = "%s/tanks-%s.csv" % (base, today.isoformat())
+    collected = _fetch_one_pi_csv(get, today_url, errors)
+    if fetched.hour < TANK_DAY_CUTOFF_HOUR or not collected:
+        y_url = "%s/tanks-%s.csv" % (base, yesterday.isoformat())
+        collected.extend(_fetch_one_pi_csv(get, y_url, errors))
+    if not collected:
+        log.info("tank grab: Pi unreachable or no data (%s) - falling back to gastanks.watch",
+                 "; ".join(errors) or "no files")
+        return None
+    rows = latest_rows_per_tank(collected)
+    missing = sorted(set(TANK_CSV_MAP) - {r["tank_number"] for r in rows})
+    if missing:
+        log.info("tank grab: Pi data missing tank(s) %s - falling back to gastanks.watch",
+                 ", ".join(missing))
+        return None
+    stamps = [r["reading_at"] for r in rows if r.get("reading_at")]
+    if not stamps:
+        log.info("tank grab: Pi data has no timestamps - falling back to gastanks.watch")
+        return None
+    reading_at = max(stamps)
+    age = (fetched - reading_at).total_seconds() / 60
+    if max_age > 0 and age > max_age:
+        log.info("tank grab: Pi readings are stale (last update %s, %.0f min old) - "
+                 "falling back to gastanks.watch", reading_at, age)
+        return None
+    log.info("tank grab: using Raspberry Pi %s (reading %s, %.0f min old)",
+             base, reading_at, max(age, 0))
+    return rows
+
+
+def _tank_snapshot_summary(rows):
+    return ", ".join("%s %s %sin" % (r["tank_number"], r.get("product") or "",
+                                     _fmt_csv_num(r["height"])) for r in rows)
+
+
+def grab_tanks(cfg, fetcher=None, sleep=None, now=None, pi_fetcher=None):
+    """--grab-tanks: read the Pi (or gastanks.watch), write the day's snapshot CSV.
+
+    Tries the store Pi first (short timeout). If that data is missing, incomplete,
+    or older than tank_pi_max_age_minutes, falls back to gastanks.watch with the
+    existing retry loop. Returns an exit code.
+    """
     import time
     fetcher = fetcher or fetch_tank_page
     sleep = time.sleep if sleep is None else sleep
@@ -1129,7 +1280,20 @@ def grab_tanks(cfg, fetcher=None, sleep=None, now=None):
     attempts = max(1, cfg.getint("tank_grab_attempts", 5))
     wait = max(0, cfg.getint("tank_grab_retry_seconds", 60))
     max_age = cfg.getint("tank_max_age_minutes", 180)
-    log.info("==== tank grab start (%s -> %s)", url, csv_dir)
+    pi_base = tank_pi_base_url(cfg)
+    log.info("==== tank grab start (Pi %s, fallback %s -> %s)",
+             pi_base or "off", url, csv_dir)
+    fetched = now() if now else dt.datetime.now().replace(microsecond=0)
+    pi_rows = fetch_pi_tank_rows(cfg, fetched, fetcher=pi_fetcher)
+    if pi_rows:
+        reading_at = max(r["reading_at"] for r in pi_rows if r.get("reading_at"))
+        path, wrote = write_tank_snapshot(csv_dir, pi_rows, reading_at)
+        if wrote:
+            log.info("tank snapshot written: %s (reading %s, business date %s, source Pi): %s",
+                     path, reading_at, tank_business_date(reading_at),
+                     _tank_snapshot_summary(pi_rows))
+        log.info("==== tank grab end, exit code 0")
+        return 0
     last_err = None
     for n in range(1, attempts + 1):
         try:
@@ -1144,11 +1308,11 @@ def grab_tanks(cfg, fetcher=None, sleep=None, now=None):
                 raise TankPageError("readings are stale: last update %s (%.0f min old)"
                                     % (reading_at, age))
             path, wrote = write_tank_snapshot(csv_dir, rows, reading_at)
-            summary = ", ".join("%s %s %sin" % (r["tank_number"], r.get("product") or "",
-                                                _fmt_csv_num(r["height"])) for r in rows)
             if wrote:
-                log.info("tank snapshot written: %s (reading %s, business date %s): %s",
-                         path, reading_at, tank_business_date(reading_at), summary)
+                log.info("tank snapshot written: %s (reading %s, business date %s, "
+                         "source gastanks.watch): %s",
+                         path, reading_at, tank_business_date(reading_at),
+                         _tank_snapshot_summary(rows))
             log.info("==== tank grab end, exit code 0")
             return 0
         except Exception as e:      # network, HTTP, parse, disk - all retried
@@ -1161,7 +1325,8 @@ def grab_tanks(cfg, fetcher=None, sleep=None, now=None):
         hint = ("The site is up but its numbers stopped updating - check the Raspberry Pi "
                 "(192.168.0.28) and the TLS-350 at the store.")
     else:
-        hint = "Check that the PC has internet and that %s opens in a browser." % url
+        hint = ("Check that the office PC can reach the store Pi at %s and that "
+                "%s opens in a browser." % (pi_base or TANK_PI_URL, url))
     log.error("tank grab FAILED after %d attempts - no snapshot written. Last error: %s. %s",
               attempts, last_err, hint)
     log.info("==== tank grab end, exit code %d", EXIT_TANK_GRAB)
@@ -1588,7 +1753,7 @@ def main(argv=None):
     ap.add_argument("--watchdog", action="store_true", help="only check that today's run finished OK; text if not")
     ap.add_argument("--setup-twilio", action="store_true", help="store Twilio credentials in Windows Credential Manager")
     ap.add_argument("--grab-tanks", action="store_true",
-                    help="only save tonight's tank readings from gastanks.watch to tank_csv_dir")
+                    help="only save tonight's tank readings from the store Pi (or gastanks.watch) to tank_csv_dir")
     ap.add_argument("--test-sms", metavar="NUMBER", help="send one test text to NUMBER (E.164, e.g. +17575551234)")
     args = ap.parse_args(argv)
     if args.setup_twilio:

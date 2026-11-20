@@ -173,46 +173,62 @@ Test it by hand once (prints one page, no window should open):
   C:\DayReport\SumatraPDF.exe -print-to "Lexmark in store" -silent "C:\some\test.pdf"
 
 
-TANK WATCHER STICK READINGS (updated Nov 11 2026 - no Gmail, no Google Drive)
+TANK WATCHER STICK READINGS (updated Nov 20 2026 - store Pi first, website fallback)
 -------------------------------------------------------------------------------
 Every night at 11:55 PM a second scheduled task, "Day Report Tanks", reads the
-public Tank Watcher page https://gastanks.watch/home and saves the 4 tanks'
-readings into one small file:
+4 tanks' readings from the store Raspberry Pi (192.168.0.28, two decimal
+places) and saves them into one small file:
    C:\AEI Data\day_reports\tank_snapshots\tank-snapshot-YYYY-MM-DD.csv
-The 5:30 AM Day Report run then writes each tank's height (inches) into
-column D of that day's row on IR_Regular, Diesel, IR_Supreme and IR_Supreme2 -
-the same cells you used to type by hand. Excel's formulas turn inches into
-gallons. "Tank 3 and 4" is left alone; it still sums the two Premium tanks.
+If the Pi is unreachable, missing a tank, or its newest reading is more than
+60 minutes old, the grab falls back to the public Tank Watcher page
+https://gastanks.watch/home (whole inches). The 5:30 AM Day Report run then
+writes each tank's height (inches, rounded to 2 decimals) into column D of
+that day's row on IR_Regular, Diesel, IR_Supreme and IR_Supreme2 - the same
+cells you used to type by hand. Excel's formulas turn inches into gallons.
+"Tank 3 and 4" is left alone; it still sums the two Premium tanks.
 
   * A cell is filled ONLY when it is blank. A typed value is never overwritten.
     A workbook backup is made before any change.
   * The 11:55 PM grab never opens a workbook and never touches the POS.
-  * Heights on the site are whole inches.
-  * The time in the file is the time Tank Watcher took the reading.
+  * Heights from the Pi are kept to two decimal places (for example 26.37).
+    The website fallback is whole inches, so use the Pi when you can.
+  * The time in the file is the time the TLS-350 took the reading.
     A reading between midnight and 5:59 AM counts as the previous day's closing.
-  * If the site can't be reached, it retries for about 5 minutes. If it
-    still fails, the log has a "tank grab FAILED" line and the task ends
-    with exit code 6. If the site is up but its numbers are more than 3 hours
-    old (Raspberry Pi 192.168.0.28 stopped sending), that also fails with exit code 6.
+  * If the Pi cannot be used, the website path retries for about 5 minutes. If
+    that also fails, the log has a "tank grab FAILED" line and the task ends
+    with exit code 6. If the website is up but its numbers are more than 3 hours
+    old, that also fails with exit code 6. The log says which source was used
+    ("source Pi" or "source gastanks.watch").
   * If last night's file is missing at 5:30 AM, the log has a WARNING and those
     stick cells stay blank for staff. The rest of the run is not affected.
   * The old Gmail / Apps Script / Google Drive route is no longer needed. If you
     installed the Apps Script, you can delete that project at script.google.com.
 
-SETUP (Mark) - about 5 minutes, logged on as Day_Report
-  1. Copy the new  dayreport.py  and  DayReport_tanks_task.xml  into  C:\DayReport
-     (replace the old dayreport.py).
-  2. Open  C:\DayReport\dayreport.ini  in Notepad. Find the tank_fill and
-     tank_csv_dir lines (or add them at the end of the [dayreport] part) so they say:
+SETUP / UPDATE (Mark) - logged on as Day_Report
+  1. Copy the new  dayreport.py  into  C:\DayReport  (replace the old file).
+     You can also copy README.txt and dayreport.ini.sample if you want the
+     updated notes. The scheduled task XML does not need to change.
+  2. A config change is not required. If tank_pi_url is left out of
+     C:\DayReport\dayreport.ini, the program already uses
+        http://192.168.0.28:8088
+     Optional: you may add that line under [dayreport] to make it explicit,
+     or set tank_pi_url blank to skip the Pi and use only gastanks.watch.
+     tank_fill and tank_csv_dir should already say:
         tank_fill = yes
         tank_csv_dir = C:\AEI Data\day_reports\tank_snapshots
-     Save.
-  3. Test it. Open Command Prompt and run this one line:
+  3. From the office PC, check that the Pi answers (you should see a file
+     named tanks-YYYY-MM-DD.csv):
+        curl http://192.168.0.28:8088/
+     If curl is not installed, open that address in a browser.
+  4. Test the grab. Open Command Prompt and run this one line:
         C:\DayReport\run_dayreport.bat --grab-tanks
-     It should end with "tank grab end, exit code 0". Then check the file is there:
+     It should end with "tank grab end, exit code 0" and a "source Pi" line.
+     Then check the snapshot file is there:
         dir "C:\AEI Data\day_reports\tank_snapshots"
-  4. Create the nightly task (asks for the Day_Report Windows password):
+  5. If the "Day Report Tanks" task is not installed yet, create it (asks for
+     the Day_Report Windows password):
         schtasks /Create /TN "Day Report Tanks" /XML C:\DayReport\DayReport_tanks_task.xml /RU "%COMPUTERNAME%\Day_Report" /RP *
-  5. Optional test of the task itself:
+     If the task already exists, leave it as is.
+  6. Optional test of the task itself:
         schtasks /Run /TN "Day Report Tanks"
      then look at the bottom of the log file for "tank snapshot written".

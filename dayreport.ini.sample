@@ -25,16 +25,21 @@ pdf_print_timeout = 120
 ; sumatra_exe = C:\DayReport\SumatraPDF.exe
 
 ; Fill tank stick inches (column D) from Tank Watcher readings.
-; The "Day Report Tanks" task (11:55 PM) runs  run_dayreport.bat --grab-tanks , which saves
-; https://gastanks.watch/home into tank-snapshot-YYYY-MM-DD.csv files in tank_csv_dir.
-; The 5:30 AM run fills blank column-D cells from them. No Gmail or Google Drive needed.
+; The "Day Report Tanks" task (11:55 PM) runs  run_dayreport.bat --grab-tanks , which
+; reads the store Pi first (two-decimal TLS readings at http://192.168.0.28:8088) and
+; falls back to https://gastanks.watch/home. It saves tank-snapshot-YYYY-MM-DD.csv
+; files in tank_csv_dir. The 5:30 AM run fills blank column-D cells from them
+; (heights rounded to 2 decimals). No Gmail or Google Drive needed.
 tank_fill    = yes
 ; Leave tank_csv_dir out to use <day_report_dir>\tank_snapshots
 tank_csv_dir = C:\AEI Data\day_reports\tank_snapshots
 ; Optional grab settings (defaults shown)
+; tank_pi_url              = http://192.168.0.28:8088
+; Leave tank_pi_url blank to skip the Pi and use only gastanks.watch.
+; tank_pi_max_age_minutes  = 60
 ; tank_grab_attempts      = 5
 ; tank_grab_retry_seconds = 60
-; Fail (exit code 6) if the site's newest reading is older than this many minutes (0 = off)
+; Fail (exit code 6) if the website fallback's newest reading is older than this many minutes (0 = off)
 ; tank_max_age_minutes    = 180
 
 ; Optional: where run status + SMS de-dup memory is kept (default: next to the log file)

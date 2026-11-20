@@ -18,7 +18,8 @@ def html():
 
 def cfg(**kw):
     cp = configparser.ConfigParser(interpolation=None)
-    base = {"tank_fill": "yes", "tank_grab_retry_seconds": "0"}
+    # tank_pi_url is empty so existing website-path tests do not try the store Pi.
+    base = {"tank_fill": "yes", "tank_grab_retry_seconds": "0", "tank_pi_url": ""}
     base.update(kw)
     cp["dayreport"] = base
     return cp["dayreport"]
@@ -158,6 +159,7 @@ def test_main_grab_mode_touches_nothing_else():
     ini = os.path.join(t, "dayreport.ini")
     open(ini, "w").write("[dayreport]\nday_report_dir = %s\nlog_file = %s\ntank_fill = yes\n"
                          "local_inbox = %s\nsource_outbox = %s\ntank_grab_attempts = 1\n"
+                         "tank_pi_url = \n"
                          % (dr, os.path.join(dr, "logs", "dayreport.log"),
                             os.path.join(t, "inbox"), os.path.join(t, "no_such_pos")))
     orig = d.fetch_tank_page
@@ -178,6 +180,120 @@ def test_main_grab_mode_touches_nothing_else():
     print("main --grab-tanks OK")
 
 
+PI_FIXTURE = os.path.join(HERE, "fixtures", "tanks-2026-11-20.csv")
+
+
+def pi_csv():
+    return open(PI_FIXTURE, encoding="utf-8").read()
+
+
+def test_parse_pi_csv_latest_per_tank():
+    all_rows = d.parse_tank_pi_csv(pi_csv())
+    assert len(all_rows) == 8
+    rows = d.latest_rows_per_tank(all_rows)
+    by = {r["tank_number"]: r for r in rows}
+    assert sorted(by) == ["01", "02", "03", "04"]
+    assert by["01"]["product"] == "Regular" and by["02"]["product"] == "Diesel"
+    assert by["03"]["product"] == "Premium" and by["04"]["product"] == "Premium"
+    assert by["01"]["height"] == 66.93 and by["02"]["height"] == 23.34
+    assert by["03"]["height"] == 56.37 and by["04"]["height"] == 14.38
+    assert by["04"]["water"] == 0.65 and by["04"]["water_volume"] == 2.31
+    assert by["01"]["reading_at"] == dt.datetime(2026, 11, 20, 22, 55, 0)
+    # earlier 22:50 heights must not win
+    assert by["01"]["volume"] == 7420
+    print("parse_pi_csv OK")
+
+
+def test_grab_uses_pi_when_fresh():
+    t = tempfile.mkdtemp()
+    now = lambda: dt.datetime(2026, 11, 20, 23, 55, 0)
+    website_calls = []
+    def website(url):
+        website_calls.append(url)
+        raise AssertionError("should not fall back to gastanks.watch")
+    def pi(url):
+        assert url.endswith("tanks-2026-11-20.csv"), url
+        return pi_csv()
+    c = cfg(tank_csv_dir=t, tank_pi_url="http://192.168.0.28:8088")
+    rc = d.grab_tanks(c, fetcher=website, sleep=lambda s: None, now=now, pi_fetcher=pi)
+    assert rc == 0 and website_calls == []
+    p = os.path.join(t, "tank-snapshot-2026-11-20.csv")
+    lines = open(p, encoding="utf-8").read().splitlines()
+    assert lines[0] == ",".join(d.TANK_CSV_COLUMNS), lines[0]
+    assert lines[1] == "01,Regular,7420,7377,1983,66.93,0,68.34,0,2026-11-20 22:55:00", lines[1]
+    assert lines[2] == "02,Diesel,1748,1739,7655,23.34,0,71.21,0,2026-11-20 22:55:00", lines[2]
+    assert lines[3].startswith("03,Premium,3708,3683,2043,56.37,"), lines[3]
+    assert lines[4].startswith("04,Premium,509,506,5242,14.38,0.65,68.29,2.31,"), lines[4]
+    bdate, when, heights = d.parse_tank_csv(p)
+    assert bdate == dt.date(2026, 11, 20)
+    assert when == dt.datetime(2026, 11, 20, 22, 55, 0)
+    assert heights == {"IR_Regular": 66.93, "Diesel": 23.34,
+                       "IR_Supreme": 56.37, "IR_Supreme2": 14.38}, heights
+    print("grab_uses_pi OK")
+
+
+def test_grab_stale_pi_falls_back():
+    t = tempfile.mkdtemp()
+    # Website fixture is 17:19 on Nov 11; Pi rows are shifted to 15:50 (more than 60 min old).
+    now = lambda: dt.datetime(2026, 11, 11, 17, 20, 0)
+    def pi(url):
+        return pi_csv().replace("2026-11-20 22:", "2026-11-11 15:")
+    c = cfg(tank_csv_dir=t, tank_pi_url="http://192.168.0.28:8088",
+            tank_grab_attempts="1")
+    rc = d.grab_tanks(c, fetcher=lambda u: html(), sleep=lambda s: None, now=now, pi_fetcher=pi)
+    assert rc == 0
+    p = os.path.join(t, "tank-snapshot-2026-11-11.csv")
+    bdate, when, heights = d.parse_tank_csv(p)
+    # website fixture heights (whole inches), not the Pi decimals
+    assert heights == {"IR_Regular": 40, "Diesel": 24, "IR_Supreme": 54, "IR_Supreme2": 14}, heights
+    assert when == dt.datetime(2026, 11, 11, 17, 19, 7)
+    print("stale_pi_fallback OK")
+
+
+def test_grab_pi_unreachable_falls_back():
+    t = tempfile.mkdtemp()
+    now = lambda: dt.datetime(2026, 11, 11, 17, 20, 0)
+    def pi(url):
+        raise OSError("network unreachable")
+    c = cfg(tank_csv_dir=t, tank_pi_url="http://192.168.0.28:8088",
+            tank_grab_attempts="1")
+    rc = d.grab_tanks(c, fetcher=lambda u: html(), sleep=lambda s: None, now=now, pi_fetcher=pi)
+    assert rc == 0
+    p = os.path.join(t, "tank-snapshot-2026-11-11.csv")
+    bdate, when, heights = d.parse_tank_csv(p)
+    assert heights["IR_Regular"] == 40 and heights["Diesel"] == 24
+    assert when == dt.datetime(2026, 11, 11, 17, 19, 7)
+    print("pi_unreachable_fallback OK")
+
+
+def test_grab_pi_after_midnight_uses_yesterday():
+    t = tempfile.mkdtemp()
+    now = lambda: dt.datetime(2026, 11, 21, 0, 10, 0)
+    seen = []
+    def pi(url):
+        seen.append(url)
+        if url.endswith("tanks-2026-11-21.csv"):
+            raise OSError("HTTP Error 404: Not Found")
+        if url.endswith("tanks-2026-11-20.csv"):
+            # last poll just before midnight - still fresh at 00:10
+            return pi_csv().replace("2026-11-20 22:50:00", "2026-11-20 23:50:00"
+                                    ).replace("2026-11-20 22:55:00", "2026-11-20 23:55:00")
+        raise AssertionError("unexpected url %s" % url)
+    def website(url):
+        raise AssertionError("should use yesterday's Pi file, not the website")
+    c = cfg(tank_csv_dir=t, tank_pi_url="http://192.168.0.28:8088")
+    rc = d.grab_tanks(c, fetcher=website, sleep=lambda s: None, now=now, pi_fetcher=pi)
+    assert rc == 0
+    assert any(u.endswith("tanks-2026-11-21.csv") for u in seen)
+    assert any(u.endswith("tanks-2026-11-20.csv") for u in seen)
+    p = os.path.join(t, "tank-snapshot-2026-11-20.csv")  # business date still Nov 20
+    bdate, when, heights = d.parse_tank_csv(p)
+    assert bdate == dt.date(2026, 11, 20)
+    assert when == dt.datetime(2026, 11, 20, 23, 55, 0)
+    assert heights["IR_Regular"] == 66.93
+    print("pi_after_midnight OK")
+
+
 if __name__ == "__main__":
     test_parse_fixture()
     test_parse_table_fallback()
@@ -188,4 +304,9 @@ if __name__ == "__main__":
     test_no_timestamp_uses_fetch_time_and_later_kept()
     test_default_dir_and_missing_warning()
     test_main_grab_mode_touches_nothing_else()
+    test_parse_pi_csv_latest_per_tank()
+    test_grab_uses_pi_when_fresh()
+    test_grab_stale_pi_falls_back()
+    test_grab_pi_unreachable_falls_back()
+    test_grab_pi_after_midnight_uses_yesterday()
     print("ALL GRAB TANKS TESTS PASSED")
